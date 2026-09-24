@@ -4,7 +4,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse,JSONResponse
 BINANCE="https://api.binance.com/api/v3/klines"; SYMBOL="BTCUSDT"; START=20.0; FEE=.001; SLIP=.0005; RISK=.01; STOP_ATR=1.5; TARGET_R=2; COOLDOWN=6; MINSTOP=.01; SCORE=75; DB=os.getenv("DB_PATH","paper_trading.db")
-app=FastAPI(title="AI BTC Scout Research V6"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
+app=FastAPI(title="AI BTC Scout Research V7.2"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
 def db():
  c=sqlite3.connect(DB);c.row_factory=sqlite3.Row
  c.execute("create table if not exists account(id integer primary key,cash real,equity real,peak real,dd real,updated text)")
@@ -122,7 +122,7 @@ def sigmoid(z):
     z=max(-30,min(30,z))
     return 1/(1+math.exp(-z))
 
-def fit_logistic(X,y,epochs=20,lr=.08,l2=.001):
+def fit_logistic(X,y,epochs=6,lr=.10,l2=.001):
     if not X: return None
     w=[0.0]*len(X[0])
     for _ in range(epochs):
@@ -148,19 +148,19 @@ def walk_forward_ml(c):
         if f is None: continue
         y=1 if c[i+horizon][4]>c[i][4] else 0
         X.append(f);Y.append(y)
-    w=fit_logistic(X,Y)
+    w=fit_logistic(X[-600:],Y[-600:])
     for i in range(cut,n-horizon):
         f=ml_features(c,i)
         if f is None: continue
         # Walk-forward refit every 96 candles using only data available before i.
-        if (i-cut)%384==0:
+        if (i-cut)%768==0:
             X=[];Y=[]
-            start=max(warm,i-1500)
+            start=max(warm,i-1000)
             for j in range(start,i-horizon):
                 fj=ml_features(c,j)
                 if fj is not None:
                     X.append(fj);Y.append(1 if c[j+horizon][4]>c[j][4] else 0)
-            w=fit_logistic(X,Y)
+            w=fit_logistic(X[-600:],Y[-600:])
         p=sigmoid(sum(a*b for a,b in zip(w,f)))
         if pos:
             hit_stop=c[i][3]<=pos["stop"]; hit_target=c[i][2]>=pos["target"]
@@ -178,7 +178,7 @@ def walk_forward_ml(c):
             at=sum(recent)/len(recent)
             stop=entry-max(STOP_ATR*at,entry*MINSTOP)
             risk=max(entry-stop,entry*MINSTOP)
-            qty=min((eq*RISK_PCT)/risk,cash/(entry*(1+FEE)))
+            qty=min((eq*RISK)/risk,cash/(entry*(1+FEE)))
             qty=min(qty,(eq*.25)/entry)
             if qty>0:
                 no=qty*entry;ef=no*FEE;cash-=no+ef;fees+=ef;slips+=entry*SLIP*qty;turn+=no
@@ -204,7 +204,7 @@ async def worker(j,d):
 PAGE='''<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <style>body{background:#070a0f;color:#eee;font-family:-apple-system,BlinkMacSystemFont,Arial;margin:0}.w{max-width:760px;margin:auto;padding:16px}.c{background:#111822;border:1px solid #263548;border-radius:20px;padding:18px;margin:12px 0}.b{font-size:32px;font-weight:800}.m{color:#9aa7b6}button{padding:12px 16px;border:0;border-radius:11px;margin:4px;font-size:16px}</style>
 </head><body><div class=w>
-<div class=c><h1>AI BTC Scout - RESEARCH V7</h1><div class=m>BTC/USDT Â· 15m entries Â· 1h trend Â· 4 fixed strategies + walk-forward ML Â· PAPER ONLY</div><div id=s>Loading...</div></div>
+<div class=c><h1>AI BTC Scout - RESEARCH V7.2</h1><div class=m>BTC/USDT Â· 15m entries Â· 1h trend Â· 4 fixed strategies + walk-forward ML Â· PAPER ONLY</div><div id=s>Loading...</div></div>
 <div class=c><div class=m>Paper equity</div><div class=b id=e>$20.00</div><div class=m>BTC</div><div class=b id=p>â</div></div>
 <div class=c><h2>Live paper engine</h2><div id=l>Loading...</div></div>
 <div class=c><h2>Research audit</h2><div class=m>Fixed strategies plus walk-forward ML. The final 30% is not used for ML fitting.</div>
@@ -214,7 +214,7 @@ async function load(){let d=await(await fetch('/api/status')).json();e.textConte
 function box(n,x){return '<div class=c><b>'+n+'</b><br>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Signals '+x.signals+' Â· Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'%<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+' ('+x.tm.toFixed(1)+'x)<br>PF '+(x.pf==null?'â':x.pf.toFixed(2))+' Â· Expectancy $'+x.expectancy.toFixed(4)+' Â· Stops '+x.stops+' Â· Targets '+x.targets+'</div>'}
 async function run(d){b.textContent='Running '+d+'-day research...';try{let q=await(await fetch('/api/backtest/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let h='<div class=c><b>Same data split for every strategy</b><br>70% training Â· 30% unseen Â· 15m entries Â· 1h trend Â· 1.5R</div>';for(const n of Object.keys(z.result.strategies)){let x=z.result.strategies[n];h+='<h2>'+n.replaceAll('_',' ')+'</h2>'+box('TRAIN 70%',x.train)+box('UNSEEN 30%',x.test)+box('25% CAP - TRAIN',x.cap_train)+box('25% CAP - UNSEEN',x.cap_test)}b.innerHTML=h;return}if(z.status==='error')throw Error(z.error)}throw Error('Timed out; paper engine is unaffected')}catch(e){b.textContent='Research failed: '+e.message}}
 
-async function mlrun(d){b.textContent='Running walk-forward ML '+d+'-day test...';let q=await(await fetch('/api/ml/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let x=z.result;b.innerHTML='<div class=c><h2>WALK-FORWARD ML â '+d+' DAYS</h2>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'% Â· PF '+(x.pf==null?'â':x.pf.toFixed(2))+'<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+'<br><span class=m>'+x.note+'</span></div>';return}if(z.status==='error'){b.textContent='ML failed: '+z.error;return}}b.textContent='ML test timed out; paper engine unaffected'}
+async function mlrun(d){b.textContent='Running walk-forward ML '+d+'-day test...';let q=await(await fetch('/api/ml/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let x=z.result;b.innerHTML='<div class=c><h2>WALK-FORWARD ML â '+d+' DAYS</h2>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'% Â· PF '+(x.pf==null?'â':x.pf.toFixed(2))+'<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+'<br><span class=m>'+x.note+'</span></div>';return}if(z.status==='error'){b.textContent='ML failed: '+z.error;return}b.textContent='ML runningâ¦ '+(i+1)+' / 240';if(z.status==='error'){b.textContent='ML failed: '+z.error;return}}b.textContent='ML test timed out; paper engine unaffected'}
 
 load();setInterval(load,60000)
 </script></body></html>'''
