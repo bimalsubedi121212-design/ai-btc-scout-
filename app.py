@@ -152,11 +152,14 @@ async def fetch(days, interval):
 
 
 def trade_stats(trades, cash, peak, mdd, fees, slips, turnover, signals=0):
-    wins = sum(x[0] > 0 for x in trades); gp = sum(x[0] for x in trades if x[0] > 0); gl = -sum(x[0] for x in trades if x[0] < 0)
-    return {"end": cash, "return_pct": (cash / START - 1) * 100, "trades": len(trades), "signals": signals,
-            "win_rate": 100 * wins / len(trades) if trades else 0, "dd": mdd * 100, "fees": fees,
+    # V8.1: ML trades are stored as numeric net P/L values.
+    # Normalize legacy tuple records too, so the stats layer cannot crash.
+    pnls = [float(x[0] if isinstance(x, (list, tuple)) else x) for x in trades]
+    wins = sum(x > 0 for x in pnls); gp = sum(x for x in pnls if x > 0); gl = -sum(x for x in pnls if x < 0)
+    return {"end": cash, "return_pct": (cash / START - 1) * 100, "trades": len(pnls), "signals": signals,
+            "win_rate": 100 * wins / len(pnls) if pnls else 0, "dd": mdd * 100, "fees": fees,
             "slippage": slips, "turnover": turnover, "pf": gp/gl if gl else None,
-            "expectancy": sum(x[0] for x in trades) / len(trades) if trades else 0}
+            "expectancy": sum(pnls) / len(pnls) if pnls else 0}
 
 
 def make_features(c, d, i):
