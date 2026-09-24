@@ -1,462 +1,141 @@
-import os, sqlite3, asyncio, math, statistics
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-import uuid
+import os,sqlite3,asyncio,math,uuid,bisect
+from datetime import datetime,timezone,timedelta
 import httpx
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-
-BINANCE = "https://api.binance.com/api/v3/klines"
-SYMBOL = "BTCUSDT"
-START_EQUITY = 20.0
-FEE = 0.0010
-SLIPPAGE = 0.0005
-RISK_PCT = 0.01
-STOP_ATR = 1.5
-TARGET_R = 2.0
-COOLDOWN_CANDLES = 24
-MIN_STOP_PCT = 0.01
-ENTRY_SCORE = 75
-DAILY_LOSS_CAP = 0.03
-DB_PATH = os.getenv("DB_PATH", "paper_trading.db")
-
-app = FastAPI(title="AI BTC Scout Final")
-state = {
-    "price": None, "score": 0, "trend": "UNKNOWN", "rsi": None,
-    "paper_equity": START_EQUITY, "cash": START_EQUITY,
-    "position": None, "last_candle": None, "last_error": None,
-    "last_scan": None, "cooldown": 0, "day": None, "day_start_equity": START_EQUITY, "pending": None, "processed": None,
-}
-
+from fastapi.responses import HTMLResponse,JSONResponse
+BINANCE="https://api.binance.com/api/v3/klines"; SYMBOL="BTCUSDT"; START=20.0; FEE=.001; SLIP=.0005; RISK=.01; STOP_ATR=1.5; TARGET_R=2; COOLDOWN=24; MINSTOP=.01; SCORE=75; DB=os.getenv("DB_PATH","paper_trading.db")
+app=FastAPI(title="AI BTC Scout Audit"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
 def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    c.execute("""CREATE TABLE IF NOT EXISTS account (
-        id INTEGER PRIMARY KEY CHECK(id=1), cash REAL NOT NULL, equity REAL NOT NULL,
-        peak REAL NOT NULL, max_dd REAL NOT NULL, updated TEXT NOT NULL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS positions (
-        id INTEGER PRIMARY KEY CHECK(id=1), entry REAL, qty REAL, stop REAL,
-        target REAL, entry_fee REAL, entry_time TEXT, entry_candle INTEGER)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, entry_time TEXT, exit_time TEXT,
-        entry REAL, exit REAL, qty REAL, stop REAL, target REAL,
-        gross_pnl REAL, fees REAL, net_pnl REAL, reason TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, candle INTEGER,
-        score INTEGER, action TEXT, price REAL, reason TEXT)""")
-    c.commit()
-    return c
-
-def load_state():
-    c = db()
-    row = c.execute("SELECT * FROM account WHERE id=1").fetchone()
-    if row:
-        state["cash"] = row["cash"]; state["paper_equity"] = row["equity"]
-    else:
-        now = datetime.now(timezone.utc).isoformat()
-        c.execute("INSERT INTO account VALUES(1,?,?,?,?,?)",
-                  (START_EQUITY, START_EQUITY, START_EQUITY, 0.0, now))
-        c.commit()
-    p = c.execute("SELECT * FROM positions WHERE id=1").fetchone()
-    state["position"] = dict(p) if p else None
-    c.close()
-
-def save_account():
-    c = db()
-    now = datetime.now(timezone.utc).isoformat()
-    row = c.execute("SELECT peak,max_dd FROM account WHERE id=1").fetchone()
-    peak = max(float(row["peak"]), state["paper_equity"])
-    dd = 0 if peak <= 0 else (peak - state["paper_equity"]) / peak
-    maxdd = max(float(row["max_dd"]), dd)
-    c.execute("UPDATE account SET cash=?,equity=?,peak=?,max_dd=?,updated=? WHERE id=1",
-              (state["cash"], state["paper_equity"], peak, maxdd, now))
-    c.commit(); c.close()
-
-def save_position(p):
-    c = db()
-    if p:
-        c.execute("""INSERT OR REPLACE INTO positions
-          (id,entry,qty,stop,target,entry_fee,entry_time,entry_candle)
-          VALUES(1,?,?,?,?,?,?,?)""",
-          (p["entry"],p["qty"],p["stop"],p["target"],p["entry_fee"],p["entry_time"],p["entry_candle"]))
-    else:
-        c.execute("DELETE FROM positions WHERE id=1")
-    c.commit(); c.close()
-
-def ema(vals, n):
-    if len(vals) < n: return [None]*len(vals)
-    k=2/(n+1); out=[None]*(n-1)
-    e=sum(vals[:n])/n; out.append(e)
-    for x in vals[n:]:
-        e=x*k+e*(1-k); out.append(e)
-    return out
-
-def rsi(vals, n=14):
-    out=[None]*len(vals)
-    if len(vals)<=n: return out
-    gains=[]; losses=[]
-    for i in range(1,n+1):
-        d=vals[i]-vals[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
-    ag=sum(gains)/n; al=sum(losses)/n
-    out[n]=100 if al==0 else 100-(100/(1+ag/al))
-    for i in range(n+1,len(vals)):
-        d=vals[i]-vals[i-1]
-        ag=(ag*(n-1)+max(d,0))/n; al=(al*(n-1)+max(-d,0))/n
-        out[i]=100 if al==0 else 100-(100/(1+ag/al))
-    return out
-
-def atr(candles, n=14):
-    tr=[]
-    for i,x in enumerate(candles):
-        if i==0: tr.append(x[2]-x[3])
-        else: tr.append(max(x[2]-x[3], abs(x[2]-candles[i-1][4]), abs(x[3]-candles[i-1][4])))
-    out=[None]*len(tr)
-    if len(tr)<n: return out
-    a=sum(tr[:n])/n; out[n-1]=a
-    for i in range(n,len(tr)):
-        a=(a*(n-1)+tr[i])/n; out[i]=a
-    return out
-
-def indicators(c):
-    close=[x[4] for x in c]; vol=[x[5] for x in c]
-    return {
-        "e20": ema(close,20), "e50": ema(close,50), "e200": ema(close,200),
-        "rsi": rsi(close,14), "atr": atr(c,14),
-        "vavg": [None if i<20 else sum(vol[i-20:i])/20 for i in range(len(c))]
-    }
-
-def score_at(c, ind, i, trend_ok=True):
-    if i<205 or any(ind[k][i] is None for k in ("e20","e50","e200","rsi","atr","vavg")):
-        return 0, "WARMUP"
-    close=c[i][4]; prev_high=c[i-1][2]
-    prior3=max(x[2] for x in c[i-3:i])
-    e20,e50,e200=ind["e20"][i],ind["e50"][i],ind["e200"][i]
-    rs,at,v=ind["rsi"][i],ind["atr"][i],ind["vavg"][i]
-    score=0; reasons=[]
-    if close>e20: score+=20; reasons.append("above EMA20")
-    if e20>e50: score+=20; reasons.append("EMA20>EMA50")
-    if 45<=rs<=65: score+=15; reasons.append("RSI healthy")
-    if c[i][5]>=1.0*v: score+=10; reasons.append("volume")
-    if close>prev_high: score+=20; reasons.append("breaks prior high")
-    if close>prior3: score+=15; reasons.append("3-candle breakout")
-    if close>e20+1.5*at: score-=15; reasons.append("stretched")
-    if not trend_ok: score=0; reasons=["1h trend filter off"]
-    return max(0,min(100,score)), ", ".join(reasons)
-
-async def fetch_klines(days, interval="5m"):
-    limit=1000
-    end=int(datetime.now(timezone.utc).timestamp()*1000)
-    start=int((datetime.now(timezone.utc)-timedelta(days=days)).timestamp()*1000)
-    out=[]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
-        cur=start
-        while cur<end:
-            r=await client.get(BINANCE,params={"symbol":SYMBOL,"interval":interval,"startTime":cur,"endTime":end,"limit":limit})
-            r.raise_for_status()
-            batch=r.json()
-            if not batch: break
-            out.extend(batch)
-            nxt=batch[-1][0]+1
-            if nxt<=cur: break
-            cur=nxt
-            if len(batch)<limit and nxt>=end: break
-    # use only completed candles
-    now=int(datetime.now(timezone.utc).timestamp()*1000)
-    return [[int(x[0]),float(x[1]),float(x[2]),float(x[3]),float(x[4]),float(x[5])] for x in out if int(x[6])<=now]
-
-def prepare_hourly_trend(h):
-    import bisect
-    close=[x[4] for x in h]
-    e20,e50,e200=ema(close,20),ema(close,50),ema(close,200)
-    opens=[x[0] for x in h]
-    return opens,e20,e50,e200
-
-def trend_ok_at(prepared, ts):
-    # Use the most recent completed 1h candle at/before the 5m candle.
-    import bisect
-    opens,e20,e50,e200=prepared
-    j=bisect.bisect_right(opens, ts)-1
-    return j>=200 and e20[j] is not None and e50[j] is not None and e200[j] is not None and e20[j]>e50[j]>e200[j]
-
-
-def simulate_range(candles, hourly, start_i, end_i, initial=20.0):
-    ind=indicators(candles)
-    trend_prepared=prepare_hourly_trend(hourly)
-    cash=initial; pos=None; trades=[]; peak=initial; maxdd=0.0
-    cooldown=0; current_day=None; day_start_equity=initial
-    first=max(205,start_i)
-    last=min(end_i,len(candles)-1)
-    for i in range(first,last):
-        x=candles[i]; ts=x[0]
-        day=datetime.fromtimestamp(ts/1000,timezone.utc).date()
-        if day!=current_day:
-            current_day=day
-            day_start_equity=cash+(pos["qty"]*x[4] if pos else 0)
-        # Manage existing position using the closed candle.
-        if pos:
-            hi,lo=x[2],x[3]
-            stop_hit=lo<=pos["stop"]; target_hit=hi>=pos["target"]
-            if stop_hit or target_hit:
-                reason="STOP" if stop_hit else "TARGET"
-                raw_exit=pos["stop"] if stop_hit else pos["target"]
-                exitp=raw_exit*(1-SLIPPAGE)
-                proceeds=pos["qty"]*exitp
-                exit_fee=proceeds*FEE
-                gross=(exitp-pos["entry"])*pos["qty"]
-                net=gross-pos["entry_fee"]-exit_fee
-                cash += proceeds-exit_fee
-                trades.append((pos["entry_time"],datetime.fromtimestamp(ts/1000,timezone.utc).isoformat(),
-                               pos["entry"],exitp,pos["qty"],pos["stop"],pos["target"],gross,
-                               pos["entry_fee"]+exit_fee,net,reason))
-                pos=None; cooldown=COOLDOWN_CANDLES
-        if cooldown>0: cooldown-=1
-        equity=cash+(pos["qty"]*x[4] if pos else 0)
-        peak=max(peak,equity); maxdd=max(maxdd,(peak-equity)/peak if peak else 0)
-        daily_loss=max(0,(day_start_equity-equity)/day_start_equity) if day_start_equity else 0
-        # Signal on candle i, enter at next candle OPEN. This prevents look-ahead.
-        if pos is None and cooldown==0 and daily_loss<DAILY_LOSS_CAP and i+1<last:
-            tok=trend_ok_at(trend_prepared,ts)
-            sc,_=score_at(candles,ind,i,tok)
-            if sc>=ENTRY_SCORE:
-                entry=candles[i+1][1]*(1+SLIPPAGE)
-                at=ind["atr"][i]
-                if at:
-                    stop=entry-STOP_ATR*at
-                    risk=max(entry-stop,entry*MIN_STOP_PCT)
-                    risk_budget=max(0,equity*RISK_PCT)
-                    qty=min(risk_budget/risk, cash/(entry*(1+FEE)))
-                    if qty>0:
-                        notional=qty*entry; entry_fee=notional*FEE
-                        cash-=notional+entry_fee
-                        pos={"entry":entry,"qty":qty,"stop":stop,
-                             "target":entry+TARGET_R*(entry-stop),"entry_fee":entry_fee,
-                             "entry_time":datetime.fromtimestamp(candles[i+1][0]/1000,timezone.utc).isoformat(),
-                             "entry_candle":candles[i+1][0]}
-    # Mark/close any remaining position at the last available close.
-    if pos:
-        exitp=candles[last][4]*(1-SLIPPAGE)
-        proceeds=pos["qty"]*exitp; exit_fee=proceeds*FEE
-        gross=(exitp-pos["entry"])*pos["qty"]; net=gross-pos["entry_fee"]-exit_fee
-        cash+=proceeds-exit_fee
-        trades.append((pos["entry_time"],datetime.fromtimestamp(candles[last][0]/1000,timezone.utc).isoformat(),
-                       pos["entry"],exitp,pos["qty"],pos["stop"],pos["target"],gross,
-                       pos["entry_fee"]+exit_fee,net,"END"))
-        pos=None
-    equity=cash
-    peak=max(peak,equity); maxdd=max(maxdd,(peak-equity)/peak if peak else 0)
-    wins=sum(1 for t in trades if t[9]>0); losses=len(trades)-wins
-    fees=sum(t[8] for t in trades)
-    gross_profit=sum(t[9] for t in trades if t[9]>0)
-    gross_loss=-sum(t[9] for t in trades if t[9]<0)
-    pf=(gross_profit/gross_loss) if gross_loss else (float("inf") if gross_profit else 0)
-    avg_win=(gross_profit/wins if wins else 0)
-    avg_loss=(gross_loss/losses if losses else 0)
-    stops=sum(1 for t in trades if t[10]=="STOP")
-    targets=sum(1 for t in trades if t[10]=="TARGET")
-    hold_minutes=[]
-    for t in trades:
-        try:
-            a=datetime.fromisoformat(t[0]); b=datetime.fromisoformat(t[1]); hold_minutes.append((b-a).total_seconds()/60)
-        except Exception: pass
-    max_losing=0; losing=0
-    for t in trades:
-        if t[9] < 0: losing += 1; max_losing=max(max_losing,losing)
-        else: losing=0
-    return {"start":initial,"end":equity,"return_pct":(equity/initial-1)*100,
-            "trades":len(trades),"wins":wins,"losses":losses,
-            "win_rate":(wins/len(trades)*100 if trades else 0),
-            "max_dd_pct":maxdd*100,"fees":fees,"profit_factor":(pf if math.isfinite(pf) else None),
-            "expectancy":(sum(t[9] for t in trades)/len(trades) if trades else 0),
-            "avg_win":avg_win,"avg_loss":avg_loss,"stops":stops,"targets":targets,
-            "stop_pct":(stops/len(trades)*100 if trades else 0),
-            "target_pct":(targets/len(trades)*100 if trades else 0),
-            "avg_hold_minutes":(sum(hold_minutes)/len(hold_minutes) if hold_minutes else 0),
-            "max_losing_streak":max_losing,"trades_detail":trades}
-
-
-async def run_backtest(days):
-    five=await fetch_klines(days,"5m")
-    hour=await fetch_klines(days+10,"1h")
-    n=len(five); cut=int(n*0.7)
-    train=simulate_range(five,hour,0,cut,20.0)
-    test=simulate_range(five,hour,cut,n,20.0)
-    return {"days":days,"candles":n,"train":train,"test":test}
-
-backtest_jobs={}
-backtest_tasks={}
-
-async def _backtest_worker(job_id, days):
-    try:
-        backtest_jobs[job_id]={"status":"running","days":days}
-        result=await run_backtest(days)
-        backtest_jobs[job_id]={"status":"done","days":days,"result":result}
-    except Exception as e:
-        backtest_jobs[job_id]={"status":"error","days":days,"error":str(e)}
-    finally:
-        backtest_tasks.pop(job_id,None)
-
-def html():
-    return """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>AI BTC Scout Final</title><style>
-    body{margin:0;background:#070a0f;color:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}
-    .wrap{max-width:760px;margin:auto;padding:18px}.card{background:#111822;border:1px solid #263548;border-radius:22px;padding:20px;margin:14px 0}
-    h1{font-size:28px;margin:0 0 6px}.muted{color:#9aa7b6}.big{font-size:34px;font-weight:800}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    .pill{display:inline-block;padding:7px 12px;border-radius:999px;background:#1c2735}.btn{padding:13px 16px;border:0;border-radius:13px;font-size:16px;margin:4px;background:#e8edf3}
-    table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #263548;text-align:left}.ok{color:#6ee7b7}.warn{color:#fbbf24}
-    @media(max-width:520px){.grid{grid-template-columns:1fr}.big{font-size:30px}}
-    </style></head><body><div class="wrap">
-    <div class="card"><h1>AI BTC Scout â FINAL</h1><div class="muted">BTC/USDT Â· 5-minute Â· PAPER ONLY Â· score â¥75 Â· 1h trend Â· 24-candle cooldown</div>
-    <div id="status">Loadingâ¦</div></div>
-    <div class="grid"><div class="card"><div class="muted">Paper equity</div><div class="big" id="eq">$20.00</div></div>
-    <div class="card"><div class="muted">BTC</div><div class="big" id="price">â</div></div></div>
-    <div class="card"><h2>Live paper engine</h2><div id="live"></div></div>
-    <div class="card"><h2>Validation</h2><button class="btn" onclick="run(180)">Run 180 days</button><button class="btn" onclick="run(365)">Run 365 days</button><div id="bt">No run yet.</div></div>
-    <div class="card"><h2>Recent paper trades</h2><div id="trades">Loadingâ¦</div></div>
-    <div class="card"><div class="muted">Paper-only. No exchange orders, no API keys, no leverage.</div></div>
-    </div><script>
-    async function load(){let r=await fetch('/api/status');let d=await r.json();
-      document.getElementById('eq').textContent='$'+d.paper_equity.toFixed(2);document.getElementById('price').textContent=d.price?'$'+d.price.toLocaleString():'â';
-      document.getElementById('status').innerHTML='<b>'+d.action+'</b> Â· Score '+d.score+' Â· '+d.trend+' Â· RSI '+(d.rsi??'â');
-      document.getElementById('live').innerHTML=d.position?`OPEN Â· Entry $${d.position.entry.toFixed(2)} Â· Stop $${d.position.stop.toFixed(2)} Â· Target $${d.position.target.toFixed(2)}`:'No open paper position';
-      document.getElementById('trades').innerHTML=d.trades.length?'<table><tr><th>Exit</th><th>Reason</th><th>Net P/L</th></tr>'+d.trades.map(t=>`<tr><td>${t.exit_time}</td><td>${t.reason}</td><td>${t.net_pnl>=0?'+':''}$${t.net_pnl.toFixed(4)}</td></tr>`).join('')+'</table>':'No completed paper trades yet.';
-    }
-    async function run(days){
-      const el=document.getElementById('bt');
-      el.textContent='Starting '+days+'-day validationâ¦';
-      try{
-        let r=await fetch('/api/backtest/'+days); let j=await r.json();
-        if(j.error) throw new Error(j.error);
-        let job=j.job_id;
-        let done=null;
-        for(let i=0;i<180;i++){
-          await new Promise(res=>setTimeout(res,2000));
-          let sr=await fetch('/api/backtest/status/'+job); let st=await sr.json();
-          if(st.status==='done'){done=st.result;break;}
-          if(st.status==='error') throw new Error(st.error||'Validation failed');
-          el.textContent='Running '+days+'-day validationâ¦ '+Math.min(99,Math.round(i/179*100))+'%';
-        }
-        if(!done) throw new Error('Validation timed out. The paper engine is still safe; try again later.');
-        function box(x){return `<div class="card"><b>${x.name}</b><br>End $${x.end.toFixed(2)} Â· Return ${x.return_pct.toFixed(2)}% Â· Trades ${x.trades}<br>Win rate ${x.win_rate.toFixed(1)}% Â· DD ${x.max_dd_pct.toFixed(2)}% Â· Fees $${x.fees.toFixed(4)} Â· PF ${x.profit_factor===null?'â':x.profit_factor.toFixed(2)}</div>`}
-        el.innerHTML=box({...done.train,name:'Training 70%'})+box({...done.test,name:'Unseen test 30%'});
-      }catch(e){el.textContent='Validation failed: '+e.message;}
-    } load();setInterval(load,60000);
-    </script></body></html>"""
-
-@app.get("/", response_class=HTMLResponse)
-async def home(): return html()
-
-@app.get("/api/status")
+ c=sqlite3.connect(DB);c.row_factory=sqlite3.Row
+ c.execute("create table if not exists account(id integer primary key,cash real,equity real,peak real,dd real,updated text)")
+ c.execute("create table if not exists positions(id integer primary key,entry real,qty real,stop real,target real,fee real,entry_time text)")
+ c.execute("create table if not exists trades(id integer primary key autoincrement,entry_time text,exit_time text,entry real,exit real,qty real,gross real,fees real,net real,reason text)");c.commit();return c
+def load():
+ c=db();a=c.execute("select * from account where id=1").fetchone()
+ if not a:c.execute("insert into account values(1,?,?,?,?,?)",(20,20,20,0,datetime.now(timezone.utc).isoformat()));c.commit();state["cash"]=state["equity"]=20
+ else:state["cash"]=a["cash"];state["equity"]=a["equity"]
+ p=c.execute("select * from positions where id=1").fetchone();state["pos"]=dict(p) if p else None;c.close()
+def save():
+ c=db();a=c.execute("select peak,dd from account where id=1").fetchone();peak=max(a["peak"],state["equity"]);dd=max(a["dd"],(peak-state["equity"])/peak if peak else 0);c.execute("update account set cash=?,equity=?,peak=?,dd=?,updated=? where id=1",(state["cash"],state["equity"],peak,dd,datetime.now(timezone.utc).isoformat()));c.commit();c.close()
+def savepos(p):
+ c=db();c.execute("delete from positions where id=1")
+ if p:c.execute("insert into positions values(1,?,?,?,?,?,?)",(p["entry"],p["qty"],p["stop"],p["target"],p["fee"],p["entry_time"]))
+ c.commit();c.close()
+def ema(v,n):
+ if len(v)<n:return [None]*len(v)
+ k=2/(n+1);o=[None]*(n-1);e=sum(v[:n])/n;o.append(e)
+ for x in v[n:]:e=x*k+e*(1-k);o.append(e)
+ return o
+def rsi(v,n=14):
+ o=[None]*len(v)
+ if len(v)<=n:return o
+ g=[];l=[]
+ for i in range(1,n+1):d=v[i]-v[i-1];g.append(max(d,0));l.append(max(-d,0))
+ ag=sum(g)/n;al=sum(l)/n;o[n]=100 if al==0 else 100-100/(1+ag/al)
+ for i in range(n+1,len(v)):
+  d=v[i]-v[i-1];ag=(ag*(n-1)+max(d,0))/n;al=(al*(n-1)+max(-d,0))/n;o[i]=100 if al==0 else 100-100/(1+ag/al)
+ return o
+def atr(c,n=14):
+ t=[x[2]-x[3] if i==0 else max(x[2]-x[3],abs(x[2]-c[i-1][4]),abs(x[3]-c[i-1][4])) for i,x in enumerate(c)];o=[None]*len(t)
+ if len(t)<n:return o
+ a=sum(t[:n])/n;o[n-1]=a
+ for i in range(n,len(t)):a=(a*(n-1)+t[i])/n;o[i]=a
+ return o
+def inds(c):
+ cl=[x[4] for x in c];v=[x[5] for x in c];return {"e20":ema(cl,20),"e50":ema(cl,50),"e200":ema(cl,200),"rsi":rsi(cl),"atr":atr(c),"va":[None if i<20 else sum(v[i-20:i])/20 for i in range(len(c))]}
+def prep(h):
+ cl=[x[4] for x in h];return [x[0] for x in h],ema(cl,20),ema(cl,50),ema(cl,200)
+def trend(p,ts):
+ o,a,b,c=p;j=bisect.bisect_right(o,ts)-1;return j>=200 and a[j] and b[j] and c[j] and a[j]>b[j]>c[j]
+def score(c,d,i,t):
+ if i<205 or any(d[k][i] is None for k in ("e20","e50","e200","rsi","atr","va")):return 0
+ x=c[i];s=0
+ if x[4]>d["e20"][i]:s+=20
+ if d["e20"][i]>d["e50"][i]:s+=20
+ if 45<=d["rsi"][i]<=65:s+=15
+ if x[5]>=d["va"][i]:s+=10
+ if x[4]>c[i-1][2]:s+=20
+ if x[4]>max(z[2] for z in c[i-3:i]):s+=15
+ if x[4]>d["e20"][i]+1.5*d["atr"][i]:s-=15
+ return max(0,min(100,s)) if t else 0
+async def fetch(days,iv):
+ end=int(datetime.now(timezone.utc).timestamp()*1000);cur=int((datetime.now(timezone.utc)-timedelta(days=days)).timestamp()*1000);out=[]
+ async with httpx.AsyncClient(timeout=20) as cl:
+  while cur<end:
+   r=await cl.get(BINANCE,params={"symbol":SYMBOL,"interval":iv,"startTime":cur,"endTime":end,"limit":1000});r.raise_for_status();b=r.json()
+   if not b:break
+   out+=b;n=b[-1][0]+1
+   if n<=cur:break
+   cur=n
+   if len(b)<1000:break
+ now=end;return [[int(x[0]),float(x[1]),float(x[2]),float(x[3]),float(x[4]),float(x[5])] for x in out if int(x[6])<=now]
+def sim(c,h,a,b,cap=None):
+ d=inds(c);p=prep(h);cash=20.;pos=None;tr=[];signals=0;turn=fees=slips=0.;peak=20.;mdd=0.;cool=0;first=max(205,a);last=min(b,len(c)-1)
+ for i in range(first,last):
+  x=c[i]
+  if pos:
+   hs=x[3]<=pos["stop"];ht=x[2]>=pos["target"]
+   if hs or ht:
+    raw=pos["stop"] if hs else pos["target"];reason="STOP" if hs else "TARGET";ex=raw*(1-SLIP);pro=pos["qty"]*ex;ef=pro*FEE;gross=(ex-pos["entry"])*pos["qty"];net=gross-pos["fee"]-ef;cash+=pro-ef;fees+=pos["fee"]+ef;slips+=raw*SLIP*pos["qty"];turn+=pro;tr.append((net,reason));pos=None;cool=COOLDOWN
+  eq=cash+(pos["qty"]*x[4] if pos else 0);peak=max(peak,eq);mdd=max(mdd,(peak-eq)/peak)
+  if not pos and cool==0 and i+1<last and score(c,d,i,trend(p,x[0]))>=SCORE:
+   signals+=1;entry=c[i+1][1]*(1+SLIP);stop=entry-STOP_ATR*d["atr"][i];risk=max(entry-stop,entry*MINSTOP);qty=min((eq*RISK)/risk,cash/(entry*(1+FEE)));qty=min(qty,(eq*cap)/entry) if cap else qty
+   if qty>0:
+    no=qty*entry;ef=no*FEE;cash-=no+ef;fees+=ef;slips+=entry*SLIP*qty;turn+=no;pos={"entry":entry,"qty":qty,"stop":stop,"target":entry+TARGET_R*(entry-stop),"fee":ef}
+  if cool:cool-=1
+ if pos:
+  ex=c[last][4]*(1-SLIP);pro=pos["qty"]*ex;ef=pro*FEE;gross=(ex-pos["entry"])*pos["qty"];tr.append((gross-pos["fee"]-ef,"END"));cash+=pro-ef;fees+=pos["fee"]+ef;turn+=pro
+ wins=sum(x[0]>0 for x in tr);loss=sum(x[0]<0 for x in tr);gp=sum(x[0] for x in tr if x[0]>0);gl=-sum(x[0] for x in tr if x[0]<0);pf=gp/gl if gl else None
+ return {"end":cash,"return_pct":(cash/20-1)*100,"trades":len(tr),"signals":signals,"win_rate":100*wins/len(tr) if tr else 0,"dd":mdd*100,"fees":fees,"slippage":slips,"turnover":turn,"tm":turn/20,"pf":pf,"expectancy":sum(x[0] for x in tr)/len(tr) if tr else 0,"stops":sum(x[1]=="STOP" for x in tr),"targets":sum(x[1]=="TARGET" for x in tr)}
+async def bt(days):
+ c=await fetch(days,"5m");h=await fetch(days+10,"1h");n=len(c);k=int(n*.7);return {"candles":n,"train":sim(c,h,0,k),"test":sim(c,h,k,n),"cap_train":sim(c,h,0,k,.25),"cap_test":sim(c,h,k,n,.25)}
+jobs={}
+async def worker(j,d):
+ try:jobs[j]={"status":"running"};jobs[j]["result"]=await bt(d);jobs[j]["status"]="done"
+ except Exception as e:jobs[j]={"status":"error","error":str(e)}
+PAGE='''<!doctype html><html><meta name=viewport content="width=device-width,initial-scale=1"><style>body{background:#070a0f;color:#eee;font-family:Arial;margin:0}.w{max-width:760px;margin:auto;padding:16px}.c{background:#111822;border:1px solid #263548;border-radius:20px;padding:18px;margin:12px 0}.b{font-size:32px;font-weight:800}.muted{color:#9aa7b6}button{padding:12px;border:0;border-radius:10px;margin:4px} </style><div class=w><div class=c><h1>AI BTC Scout â AUDIT</h1><div class=muted>BTC/USDT Â· PAPER ONLY Â· score â¥75</div><div id=s></div></div><div class=c><span class=muted>Equity</span><div class=b id=e>$20.00</div><span class=muted>BTC</span><div class=b id=p>â</div></div><div class=c><h2>Live paper engine</h2><div id=l>No open paper position</div></div><div class=c><h2>Research audit</h2><button onclick=run(180)>180 days</button><button onclick=run(365)>365 days</button><div id=b>Not run yet.</div></div></div><script>async function load(){let d=await(await fetch('/api/status')).json();e.textContent='$'+d.equity.toFixed(2);p.textContent=d.price?'$'+Math.round(d.price).toLocaleString():'â';s.innerHTML='<b>'+d.action+'</b> Â· Score '+d.score+' Â· '+d.trend+' Â· RSI '+(d.rsi??'â');l.innerHTML=d.position?'OPEN Â· Entry $'+d.position.entry.toFixed(2)+' Â· Stop $'+d.position.stop.toFixed(2)+' Â· Target $'+d.position.target.toFixed(2):'No open paper position'}function box(n,x){return '<div class=c><b>'+n+'</b><br>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Signals '+x.signals+' Â· Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'%<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+' ('+x.tm.toFixed(1)+'Ã)<br>PF '+(x.pf==null?'â':x.pf.toFixed(2))+' Â· Expectancy $'+x.expectancy.toFixed(4)+' Â· Stops '+x.stops+' Â· Targets '+x.targets+'</div>'}async function run(d){b.textContent='Running '+d+'-day auditâ¦';let q=await(await fetch('/api/backtest/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let r=z.result;b.innerHTML=box('CURRENT â TRAIN 70%',r.train)+box('CURRENT â UNSEEN 30%',r.test)+box('25% NOTIONAL CAP â TRAIN 70%',r.cap_train)+box('25% NOTIONAL CAP â UNSEEN 30%',r.cap_test);return}if(z.status==='error'){b.textContent='Failed: '+z.error;return}}b.textContent='Timed out; paper engine remains safe.'}load();setInterval(load,60000)</script>'''
+@app.get('/',response_class=HTMLResponse)
+async def home():return PAGE
+@app.get('/api/status')
 async def status():
-    load_state()
-    c=db(); trades=[dict(x) for x in c.execute("SELECT entry_time,exit_time,net_pnl,reason FROM trades ORDER BY id DESC LIMIT 20").fetchall()]; c.close()
-    marked = state["cash"]
-    if state["position"] and state["price"]:
-        marked += state["position"]["qty"] * state["price"]
-    return {"price":state["price"],"score":state["score"],"trend":state["trend"],"rsi":state["rsi"],
-            "paper_equity":marked,"cash":state["cash"],"position":state["position"],
-            "action":("PAPER POSITION" if state["position"] else ("SIGNAL" if state["score"]>=60 else "WAIT")),
-            "last_scan":state["last_scan"],"last_error":state["last_error"],"trades":trades}
-
-@app.get("/api/backtest/{days}")
-async def backtest(days:int):
-    if days not in (180,365): return JSONResponse({"error":"Use 180 or 365 days"},status_code=400)
-    for jid, job in list(backtest_jobs.items()):
-        if job.get("days")==days and job.get("status")=="running":
-            return {"job_id":jid,"status":"running","days":days}
-    job_id=uuid.uuid4().hex[:12]
-    backtest_jobs[job_id]={"status":"queued","days":days}
-    backtest_tasks[job_id]=asyncio.create_task(_backtest_worker(job_id,days))
-    return {"job_id":job_id,"status":"queued","days":days}
-
-@app.get("/api/backtest/status/{job_id}")
-async def backtest_status(job_id:str):
-    job=backtest_jobs.get(job_id)
-    if not job:
-        return JSONResponse({"error":"Unknown validation job"},status_code=404)
-    return job
-
-
-async def scan_loop():
-    await asyncio.sleep(3)
-    while True:
-        try:
-            c=await fetch_klines(3,"5m"); h=await fetch_klines(10,"1h")
-            if len(c)<220: raise RuntimeError("Not enough candles")
-            load_state()
-            ind=indicators(c); i=len(c)-1; ts=c[i][0]
-            tok=trend_ok_at(prepare_hourly_trend(h),ts); sc,reason=score_at(c,ind,i,tok)
-            state["price"]=c[i][4]; state["score"]=sc
-            state["trend"]="BULLISH" if tok else "BEARISH"; state["rsi"]=ind["rsi"][i]
-            state["last_candle"]=ts; state["last_scan"]=datetime.now(timezone.utc).isoformat()
-            state["last_error"]=None
-
-            # Only process each closed candle once.
-            if state.get("processed") != ts:
-                # 1) Execute pending signal at this candle's OPEN.
-                if state.get("pending") and not state["position"]:
-                    pnd=state["pending"]
-                    entry=c[i][1]*(1+SLIPPAGE)
-                    at=pnd["atr"]; equity=state["cash"]
-                    if at:
-                        stop=entry-STOP_ATR*at
-                        risk=max(entry-stop,entry*MIN_STOP_PCT)
-                        qty=min((equity*RISK_PCT)/risk, equity/(entry*(1+FEE)))
-                        if qty>0:
-                            notional=qty*entry; fee=notional*FEE
-                            state["cash"]-=notional+fee
-                            p={"entry":entry,"qty":qty,"stop":stop,
-                               "target":entry+TARGET_R*(entry-stop),"entry_fee":fee,
-                               "entry_time":datetime.fromtimestamp(c[i][0]/1000,timezone.utc).isoformat(),
-                               "entry_candle":c[i][0]}
-                            state["position"]=p; save_position(p)
-                    state["pending"]=None
-
-                # 2) Manage open position. If both are hit in one candle, STOP wins.
-                if state["position"]:
-                    p=state["position"]; hi,lo=c[i][2],c[i][3]
-                    hit_stop=lo<=p["stop"]; hit_target=hi>=p["target"]
-                    if hit_stop or hit_target:
-                        reason_exit="STOP" if hit_stop else "TARGET"
-                        raw=p["stop"] if hit_stop else p["target"]
-                        exitp=raw*(1-SLIPPAGE)
-                        proceeds=p["qty"]*exitp; fee=proceeds*FEE
-                        gross=(exitp-p["entry"])*p["qty"]; net=gross-p["entry_fee"]-fee
-                        state["cash"]+=proceeds-fee; state["paper_equity"]=state["cash"]
-                        cc=db()
-                        cc.execute("""INSERT INTO trades(entry_time,exit_time,entry,exit,qty,stop,target,gross_pnl,fees,net_pnl,reason)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                           (p["entry_time"],datetime.fromtimestamp(ts/1000,timezone.utc).isoformat(),
-                            p["entry"],exitp,p["qty"],p["stop"],p["target"],gross,p["entry_fee"]+fee,net,reason_exit))
-                        cc.execute("INSERT INTO events(ts,candle,score,action,price,reason) VALUES(?,?,?,?,?,?)",
-                                   (datetime.now(timezone.utc).isoformat(),ts,sc,reason_exit,exitp,reason))
-                        cc.commit(); cc.close()
-                        state["position"]=None; save_position(None); state["cooldown"]=COOLDOWN_CANDLES
-                        save_account()
-
-                # 3) If flat, schedule a signal for the NEXT candle rather than entering on signal close.
-                if not state["position"] and state["cooldown"]==0:
-                    if sc>=ENTRY_SCORE and tok:
-                        # daily loss gate based on realized cash vs start-of-day equity
-                        today=datetime.fromtimestamp(ts/1000,timezone.utc).date()
-                        if state.get("day")!=str(today):
-                            state["day"]=str(today); state["day_start_equity"]=state["cash"]
-                        daily_loss=max(0,(state["day_start_equity"]-state["cash"])/state["day_start_equity"]) if state["day_start_equity"] else 0
-                        if daily_loss < DAILY_LOSS_CAP:
-                            state["pending"]={"atr":ind["atr"][i],"signal_candle":ts}
-                            cc=db(); cc.execute("INSERT INTO events(ts,candle,score,action,price,reason) VALUES(?,?,?,?,?,?)",
-                                (datetime.now(timezone.utc).isoformat(),ts,sc,"SIGNAL",c[i][4],reason)); cc.commit(); cc.close()
-                if state["cooldown"]>0: state["cooldown"]-=1
-                state["paper_equity"]=state["cash"] + (state["position"]["qty"]*state["price"] if state["position"] else 0.0)
-                state["processed"]=ts
-                save_account()
-        except Exception as e:
-            state["last_error"]=str(e)
-        await asyncio.sleep(60)
-
-@app.on_event("startup")
-async def startup():
-    load_state()
-    asyncio.create_task(scan_loop())
+ load();eq=state['cash']+(state['pos']['qty']*state['price'] if state['pos'] and state['price'] else 0);return {'equity':eq,'cash':state['cash'],'price':state['price'],'score':state['score'],'trend':state['trend'],'rsi':state['rsi'],'position':state['pos'],'action':'PAPER POSITION' if state['pos'] else ('SIGNAL' if state['score']>=SCORE else 'WAIT'),'error':state['err']}
+@app.get('/api/backtest/{days}')
+async def start(days:int):
+ if days not in (180,365):return JSONResponse({'error':'Use 180 or 365 days'},400)
+ j=uuid.uuid4().hex[:10];jobs[j]={'status':'queued'};asyncio.create_task(worker(j,days));return {'job_id':j}
+@app.get('/api/backtest/status/{j}')
+async def js(j):return jobs.get(j,{'status':'error','error':'Unknown job'})
+async def scan():
+ await asyncio.sleep(3)
+ while True:
+  try:
+   c=await fetch(3,'5m');h=await fetch(10,'1h');load();d=inds(c);i=len(c)-1;ts=c[i][0];t=trend(prep(h),ts);sc=score(c,d,i,t)
+   state.update(price=c[i][4],score=sc,trend='BULLISH' if t else 'BEARISH',rsi=d['rsi'][i],err=None)
+   if state['processed']!=ts:
+    # Enter pending signal on the next completed candle's open.
+    if state['pending'] and not state['pos']:
+     entry=c[i][1]*(1+SLIP);at=state['pending'];stop=entry-STOP_ATR*at;risk=max(entry-stop,entry*MINSTOP)
+     qty=min((state['cash']*RISK)/risk,state['cash']/(entry*(1+FEE)))
+     if qty>0:
+      no=qty*entry;ef=no*FEE;state['cash']-=no+ef
+      state['pos']={'entry':entry,'qty':qty,'stop':stop,'target':entry+TARGET_R*(entry-stop),'fee':ef,'entry_time':datetime.fromtimestamp(ts/1000,timezone.utc).isoformat()};savepos(state['pos'])
+     state['pending']=None
+    # Conservative stop-first exit if both levels occur in one candle.
+    if state['pos']:
+     q=state['pos'];hs=c[i][3]<=q['stop'];ht=c[i][2]>=q['target']
+     if hs or ht:
+      raw=q['stop'] if hs else q['target'];reason='STOP' if hs else 'TARGET';ex=raw*(1-SLIP);pro=q['qty']*ex;ef=pro*FEE;gross=(ex-q['entry'])*q['qty'];net=gross-q['fee']-ef
+      state['cash']+=pro-ef
+      cc=db();cc.execute("insert into trades(entry_time,exit_time,entry,exit,qty,gross,fees,net,reason) values(?,?,?,?,?,?,?,?,?)",(q['entry_time'],datetime.fromtimestamp(ts/1000,timezone.utc).isoformat(),q['entry'],ex,q['qty'],gross,q['fee']+ef,net,reason));cc.commit();cc.close()
+      state['pos']=None;savepos(None);state['cool']=COOLDOWN
+    if not state['pos'] and state['cool']==0 and sc>=SCORE and t:
+     state['pending']=d['atr'][i]
+    if state['cool']>0:state['cool']-=1
+    state['equity']=state['cash']+(state['pos']['qty']*state['price'] if state['pos'] else 0);state['processed']=ts;save()
+  except Exception as e:state['err']=str(e)
+  await asyncio.sleep(60)
+@app.on_event('startup')
+async def startup():load();asyncio.create_task(scan())
 
  
  
