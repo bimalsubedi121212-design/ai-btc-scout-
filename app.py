@@ -142,6 +142,10 @@ def walk_forward_ml(c):
     X=[];Y=[]
     preds=[]
     cash=20.;pos=None;tr=[];fees=slips=turn=0.;peak=20.;mdd=0.
+    # Probability diagnostics: these let us see whether the model is simply too conservative.
+    pred_count=0; prob_sum=0.0; prob_min=1.0; prob_max=0.0
+    above50=above52=above55=above58=above60=0
+    candidates=0
     # Labels are whether the next 4 entry candles are net-positive before costs.
     for i in range(warm,cut-horizon):
         f=ml_features(c,i)
@@ -162,6 +166,9 @@ def walk_forward_ml(c):
                     X.append(fj);Y.append(1 if c[j+horizon][4]>c[j][4] else 0)
             w=fit_logistic(X[-600:],Y[-600:])
         p=sigmoid(sum(a*b for a,b in zip(w,f)))
+        pred_count+=1; prob_sum+=p; prob_min=min(prob_min,p); prob_max=max(prob_max,p)
+        above50+=p>=0.50; above52+=p>=0.52; above55+=p>=0.55; above58+=p>=0.58; above60+=p>=0.60
+        if p>=0.55: candidates+=1
         if pos:
             hit_stop=c[i][3]<=pos["stop"]; hit_target=c[i][2]>=pos["target"]
             if hit_stop or hit_target:
@@ -194,6 +201,10 @@ def walk_forward_ml(c):
             "win_rate":100*wins/len(tr) if tr else 0,"dd":100*mdd,"fees":fees,
             "slippage":slips,"turnover":turn,"pf":pf,
             "expectancy":sum(tr)/len(tr) if tr else 0,"test_start_index":cut,
+            "predictions":pred_count,"avg_prob":(prob_sum/pred_count if pred_count else 0),
+            "min_prob":(prob_min if pred_count else 0),"max_prob":(prob_max if pred_count else 0),
+            "above_50":above50,"above_52":above52,"above_55":above55,
+            "above_58":above58,"above_60":above60,"candidates":candidates,
             "note":"Walk-forward ML; 30% test period was not used for fitting."}
 
 
@@ -214,7 +225,7 @@ async function load(){let d=await(await fetch('/api/status')).json();e.textConte
 function box(n,x){return '<div class=c><b>'+n+'</b><br>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Signals '+x.signals+' Â· Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'%<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+' ('+x.tm.toFixed(1)+'x)<br>PF '+(x.pf==null?'â':x.pf.toFixed(2))+' Â· Expectancy $'+x.expectancy.toFixed(4)+' Â· Stops '+x.stops+' Â· Targets '+x.targets+'</div>'}
 async function run(d){b.textContent='Running '+d+'-day research...';try{let q=await(await fetch('/api/backtest/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let h='<div class=c><b>Same data split for every strategy</b><br>70% training Â· 30% unseen Â· 15m entries Â· 1h trend Â· 1.5R</div>';for(const n of Object.keys(z.result.strategies)){let x=z.result.strategies[n];h+='<h2>'+n.replaceAll('_',' ')+'</h2>'+box('TRAIN 70%',x.train)+box('UNSEEN 30%',x.test)+box('25% CAP - TRAIN',x.cap_train)+box('25% CAP - UNSEEN',x.cap_test)}b.innerHTML=h;return}if(z.status==='error')throw Error(z.error)}throw Error('Timed out; paper engine is unaffected')}catch(e){b.textContent='Research failed: '+e.message}}
 
-async function mlrun(d){b.textContent='Running walk-forward ML '+d+'-day test...';let q=await(await fetch('/api/ml/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let x=z.result;b.innerHTML='<div class=c><h2>WALK-FORWARD ML â '+d+' DAYS</h2>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'% Â· PF '+(x.pf==null?'â':x.pf.toFixed(2))+'<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+'<br><span class=m>'+x.note+'</span></div>';return}if(z.status==='error'){b.textContent='ML failed: '+z.error;return}b.textContent='ML runningâ¦ '+(i+1)+' / 240';if(z.status==='error'){b.textContent='ML failed: '+z.error;return}}b.textContent='ML test timed out; paper engine unaffected'}
+async function mlrun(d){b.textContent='Running walk-forward ML '+d+'-day test...';let q=await(await fetch('/api/ml/'+d)).json();for(let i=0;i<240;i++){await new Promise(r=>setTimeout(r,2000));let z=await(await fetch('/api/backtest/status/'+q.job_id)).json();if(z.status==='done'){let x=z.result;b.innerHTML='<div class=c><h2>WALK-FORWARD ML â '+d+' DAYS</h2>End $'+x.end.toFixed(2)+' Â· Return '+x.return_pct.toFixed(2)+'% Â· Trades '+x.trades+'<br>Win '+x.win_rate.toFixed(1)+'% Â· DD '+x.dd.toFixed(2)+'% Â· PF '+(x.pf==null?'â':x.pf.toFixed(2))+'<br>Fees $'+x.fees.toFixed(4)+' Â· Slippage $'+x.slippage.toFixed(4)+' Â· Turnover $'+x.turnover.toFixed(2)+'<hr><b>ML diagnostics</b><br>Predictions '+x.predictions+' Â· Avg probability '+x.avg_prob.toFixed(3)+' Â· Min '+x.min_prob.toFixed(3)+' Â· Max '+x.max_prob.toFixed(3)+'<br>â¥50%: '+x.above_50+' Â· â¥52%: '+x.above_52+' Â· â¥55%: '+x.above_55+' Â· â¥58%: '+x.above_58+' Â· â¥60%: '+x.above_60+'<br>Entry candidates at 55%: '+x.candidates+'<br><span class=m>'+x.note+'</span></div>';return}if(z.status==='error'){b.textContent='ML failed: '+z.error;return}b.textContent='ML runningâ¦ '+(i+1)+' / 240';if(z.status==='error'){b.textContent='ML failed: '+z.error;return}}b.textContent='ML test timed out; paper engine unaffected'}
 
 load();setInterval(load,60000)
 </script></body></html>'''
