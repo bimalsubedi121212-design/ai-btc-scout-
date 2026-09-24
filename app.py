@@ -14,7 +14,9 @@ SLIPPAGE = 0.0005
 RISK_PCT = 0.01
 STOP_ATR = 1.5
 TARGET_R = 2.0
-COOLDOWN_CANDLES = 6
+COOLDOWN_CANDLES = 24
+MIN_STOP_PCT = 0.01
+ENTRY_SCORE = 75
 DAILY_LOSS_CAP = 0.03
 DB_PATH = os.getenv("DB_PATH", "paper_trading.db")
 
@@ -133,8 +135,8 @@ def score_at(c, ind, i, trend_ok=True):
     score=0; reasons=[]
     if close>e20: score+=20; reasons.append("above EMA20")
     if e20>e50: score+=20; reasons.append("EMA20>EMA50")
-    if 45<=rs<=68: score+=15; reasons.append("RSI healthy")
-    if c[i][5]>=0.8*v: score+=10; reasons.append("volume")
+    if 45<=rs<=65: score+=15; reasons.append("RSI healthy")
+    if c[i][5]>=1.0*v: score+=10; reasons.append("volume")
     if close>prev_high: score+=20; reasons.append("breaks prior high")
     if close>prior3: score+=15; reasons.append("3-candle breakout")
     if close>e20+1.5*at: score-=15; reasons.append("stretched")
@@ -215,12 +217,12 @@ def simulate_range(candles, hourly, start_i, end_i, initial=20.0):
         if pos is None and cooldown==0 and daily_loss<DAILY_LOSS_CAP and i+1<last:
             tok=trend_ok_at(trend_prepared,ts)
             sc,_=score_at(candles,ind,i,tok)
-            if sc>=60:
+            if sc>=ENTRY_SCORE:
                 entry=candles[i+1][1]*(1+SLIPPAGE)
                 at=ind["atr"][i]
                 if at:
                     stop=entry-STOP_ATR*at
-                    risk=max(entry-stop,entry*0.002)
+                    risk=max(entry-stop,entry*MIN_STOP_PCT)
                     risk_budget=max(0,equity*RISK_PCT)
                     qty=min(risk_budget/risk, cash/(entry*(1+FEE)))
                     if qty>0:
@@ -286,7 +288,7 @@ def html():
     table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #263548;text-align:left}.ok{color:#6ee7b7}.warn{color:#fbbf24}
     @media(max-width:520px){.grid{grid-template-columns:1fr}.big{font-size:30px}}
     </style></head><body><div class="wrap">
-    <div class="card"><h1>AI BTC Scout â FINAL</h1><div class="muted">BTC/USDT Â· 5-minute Â· PAPER ONLY</div>
+    <div class="card"><h1>AI BTC Scout â FINAL</h1><div class="muted">BTC/USDT Â· 5-minute Â· PAPER ONLY Â· score â¥75 Â· 1h trend Â· 24-candle cooldown</div>
     <div id="status">Loadingâ¦</div></div>
     <div class="grid"><div class="card"><div class="muted">Paper equity</div><div class="big" id="eq">$20.00</div></div>
     <div class="card"><div class="muted">BTC</div><div class="big" id="price">â</div></div></div>
@@ -380,7 +382,7 @@ async def scan_loop():
                     at=pnd["atr"]; equity=state["cash"]
                     if at:
                         stop=entry-STOP_ATR*at
-                        risk=max(entry-stop,entry*0.002)
+                        risk=max(entry-stop,entry*MIN_STOP_PCT)
                         qty=min((equity*RISK_PCT)/risk, equity/(entry*(1+FEE)))
                         if qty>0:
                             notional=qty*entry; fee=notional*FEE
