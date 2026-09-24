@@ -1,11 +1,10 @@
-
 import os,sqlite3,asyncio,math,uuid,bisect
 from datetime import datetime,timezone,timedelta
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse,JSONResponse
-BINANCE="https://api.binance.com/api/v3/klines"; SYMBOL="BTCUSDT"; START=20.0; FEE=.001; SLIP=.0005; RISK=.01; STOP_ATR=1.5; TARGET_R=2; COOLDOWN=24; MINSTOP=.01; SCORE=75; DB=os.getenv("DB_PATH","paper_trading.db")
-app=FastAPI(title="AI BTC Scout Research V4"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
+BINANCE="https://api.binance.com/api/v3/klines"; SYMBOL="BTCUSDT"; START=20.0; FEE=.001; SLIP=.0005; RISK=.01; STOP_ATR=1.5; TARGET_R=2; COOLDOWN=6; MINSTOP=.01; SCORE=75; DB=os.getenv("DB_PATH","paper_trading.db")
+app=FastAPI(title="AI BTC Scout Research V5"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
 def db():
  c=sqlite3.connect(DB);c.row_factory=sqlite3.Row
  c.execute("create table if not exists account(id integer primary key,cash real,equity real,peak real,dd real,updated text)")
@@ -99,7 +98,7 @@ def sim(c,h,a,b,cap=None):
  wins=sum(x[0]>0 for x in tr);loss=sum(x[0]<0 for x in tr);gp=sum(x[0] for x in tr if x[0]>0);gl=-sum(x[0] for x in tr if x[0]<0);pf=gp/gl if gl else None
  return {"end":cash,"return_pct":(cash/20-1)*100,"trades":len(tr),"signals":signals,"win_rate":100*wins/len(tr) if tr else 0,"dd":mdd*100,"fees":fees,"slippage":slips,"turnover":turn,"tm":turn/20,"pf":pf,"expectancy":sum(x[0] for x in tr)/len(tr) if tr else 0,"stops":sum(x[1]=="STOP" for x in tr),"targets":sum(x[1]=="TARGET" for x in tr)}
 async def bt(days):
- c=await fetch(days,"15m");h=await fetch(days+10,"1h");n=len(c);k=int(n*.7);return {"candles":n,"train":sim(c,h,0,k),"test":sim(c,h,k,n),"cap_train":sim(c,h,0,k,.25),"cap_test":sim(c,h,k,n,.25)}
+ c=await fetch(days,"1h");h=await fetch(days+30,"4h");n=len(c);k=int(n*.7);return {"candles":n,"train":sim(c,h,0,k),"test":sim(c,h,k,n),"cap_train":sim(c,h,0,k,.25),"cap_test":sim(c,h,k,n,.25)}
 jobs={}
 async def worker(j,d):
  try:jobs[j]={"status":"running"};jobs[j]["result"]=await bt(d);jobs[j]["status"]="done"
@@ -147,3 +146,5 @@ async def scan():
   await asyncio.sleep(60)
 @app.on_event('startup')
 async def startup():load();asyncio.create_task(scan())
+
+    
