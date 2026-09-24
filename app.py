@@ -1,6 +1,7 @@
 import os, sqlite3, asyncio, math, statistics
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+import uuid
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -145,7 +146,7 @@ async def fetch_klines(days, interval="5m"):
     end=int(datetime.now(timezone.utc).timestamp()*1000)
     start=int((datetime.now(timezone.utc)-timedelta(days=days)).timestamp()*1000)
     out=[]
-    async with httpx.AsyncClient(timeout=25) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
         cur=start
         while cur<end:
             r=await client.get(BINANCE,params={"symbol":SYMBOL,"interval":interval,"startTime":cur,"endTime":end,"limit":limit})
@@ -156,28 +157,29 @@ async def fetch_klines(days, interval="5m"):
             nxt=batch[-1][0]+1
             if nxt<=cur: break
             cur=nxt
-            if len(batch)<limit: break
+            if len(batch)<limit and nxt>=end: break
     # use only completed candles
     now=int(datetime.now(timezone.utc).timestamp()*1000)
     return [[int(x[0]),float(x[1]),float(x[2]),float(x[3]),float(x[4]),float(x[5])] for x in out if int(x[6])<=now]
 
-def trend_series_1h(h):
+def prepare_hourly_trend(h):
+    import bisect
     close=[x[4] for x in h]
     e20,e50,e200=ema(close,20),ema(close,50),ema(close,200)
-    return e20,e50,e200
-
-def trend_ok_for_time(h, ts):
-    # Last completed 1h candle whose open time <= 5m candle timestamp.
-    import bisect
     opens=[x[0] for x in h]
+    return opens,e20,e50,e200
+
+def trend_ok_at(prepared, ts):
+    # Use the most recent completed 1h candle at/before the 5m candle.
+    import bisect
+    opens,e20,e50,e200=prepared
     j=bisect.bisect_right(opens, ts)-1
-    if j<200: return False
-    e20,e50,e200=trend_series_1h(h)
-    return e20[j] is not None and e50[j] is not None and e200[j] is not None and e20[j]>e50[j]>e200[j]
+    return j>=200 and e20[j] is not None and e50[j] is not None and e200[j] is not None and e20[j]>e50[j]>e200[j]
 
 
 def simulate_range(candles, hourly, start_i, end_i, initial=20.0):
     ind=indicators(candles)
+    trend_prepared=prepare_hourly_trend(hourly)
     cash=initial; pos=None; trades=[]; peak=initial; maxdd=0.0
     cooldown=0; current_day=None; day_start_equity=initial
     first=max(205,start_i)
@@ -211,7 +213,7 @@ def simulate_range(candles, hourly, start_i, end_i, initial=20.0):
         daily_loss=max(0,(day_start_equity-equity)/day_start_equity) if day_start_equity else 0
         # Signal on candle i, enter at next candle OPEN. This prevents look-ahead.
         if pos is None and cooldown==0 and daily_loss<DAILY_LOSS_CAP and i+1<last:
-            tok=trend_ok_for_time(hourly,ts)
+            tok=trend_ok_at(trend_prepared,ts)
             sc,_=score_at(candles,ind,i,tok)
             if sc>=60:
                 entry=candles[i+1][1]*(1+SLIPPAGE)
@@ -261,6 +263,19 @@ async def run_backtest(days):
     test=simulate_range(five,hour,cut,n,20.0)
     return {"days":days,"candles":n,"train":train,"test":test}
 
+backtest_jobs={}
+backtest_tasks={}
+
+async def _backtest_worker(job_id, days):
+    try:
+        backtest_jobs[job_id]={"status":"running","days":days}
+        result=await run_backtest(days)
+        backtest_jobs[job_id]={"status":"done","days":days,"result":result}
+    except Exception as e:
+        backtest_jobs[job_id]={"status":"error","days":days,"error":str(e)}
+    finally:
+        backtest_tasks.pop(job_id,None)
+
 def html():
     return """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>AI BTC Scout Final</title><style>
@@ -286,9 +301,25 @@ def html():
       document.getElementById('live').innerHTML=d.position?`OPEN Â· Entry $${d.position.entry.toFixed(2)} Â· Stop $${d.position.stop.toFixed(2)} Â· Target $${d.position.target.toFixed(2)}`:'No open paper position';
       document.getElementById('trades').innerHTML=d.trades.length?'<table><tr><th>Exit</th><th>Reason</th><th>Net P/L</th></tr>'+d.trades.map(t=>`<tr><td>${t.exit_time}</td><td>${t.reason}</td><td>${t.net_pnl>=0?'+':''}$${t.net_pnl.toFixed(4)}</td></tr>`).join('')+'</table>':'No completed paper trades yet.';
     }
-    async function run(days){document.getElementById('bt').textContent='Running '+days+'-day validationâ¦';let r=await fetch('/api/backtest/'+days);let d=await r.json();
-      function box(x){return `<div class="card"><b>${x.name}</b><br>End $${x.end.toFixed(2)} Â· Return ${x.return_pct.toFixed(2)}% Â· Trades ${x.trades}<br>Win rate ${x.win_rate.toFixed(1)}% Â· DD ${x.max_dd_pct.toFixed(2)}% Â· Fees $${x.fees.toFixed(4)} Â· PF ${x.profit_factor===Infinity?'â':x.profit_factor.toFixed(2)}</div>`}
-      document.getElementById('bt').innerHTML=box({...d.train,name:'Training 70%'})+box({...d.test,name:'Unseen test 30%'});
+    async function run(days){
+      const el=document.getElementById('bt');
+      el.textContent='Starting '+days+'-day validationâ¦';
+      try{
+        let r=await fetch('/api/backtest/'+days); let j=await r.json();
+        if(j.error) throw new Error(j.error);
+        let job=j.job_id;
+        let done=null;
+        for(let i=0;i<180;i++){
+          await new Promise(res=>setTimeout(res,2000));
+          let sr=await fetch('/api/backtest/status/'+job); let st=await sr.json();
+          if(st.status==='done'){done=st.result;break;}
+          if(st.status==='error') throw new Error(st.error||'Validation failed');
+          el.textContent='Running '+days+'-day validationâ¦ '+Math.min(99,Math.round(i/179*100))+'%';
+        }
+        if(!done) throw new Error('Validation timed out. The paper engine is still safe; try again later.');
+        function box(x){return `<div class="card"><b>${x.name}</b><br>End $${x.end.toFixed(2)} Â· Return ${x.return_pct.toFixed(2)}% Â· Trades ${x.trades}<br>Win rate ${x.win_rate.toFixed(1)}% Â· DD ${x.max_dd_pct.toFixed(2)}% Â· Fees $${x.fees.toFixed(4)} Â· PF ${x.profit_factor===null?'â':x.profit_factor.toFixed(2)}</div>`}
+        el.innerHTML=box({...done.train,name:'Training 70%'})+box({...done.test,name:'Unseen test 30%'});
+      }catch(e){el.textContent='Validation failed: '+e.message;}
     } load();setInterval(load,60000);
     </script></body></html>"""
 
@@ -310,8 +341,20 @@ async def status():
 @app.get("/api/backtest/{days}")
 async def backtest(days:int):
     if days not in (180,365): return JSONResponse({"error":"Use 180 or 365 days"},status_code=400)
-    try: return await run_backtest(days)
-    except Exception as e: return JSONResponse({"error":str(e)},status_code=500)
+    for jid, job in list(backtest_jobs.items()):
+        if job.get("days")==days and job.get("status")=="running":
+            return {"job_id":jid,"status":"running","days":days}
+    job_id=uuid.uuid4().hex[:12]
+    backtest_jobs[job_id]={"status":"queued","days":days}
+    backtest_tasks[job_id]=asyncio.create_task(_backtest_worker(job_id,days))
+    return {"job_id":job_id,"status":"queued","days":days}
+
+@app.get("/api/backtest/status/{job_id}")
+async def backtest_status(job_id:str):
+    job=backtest_jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error":"Unknown validation job"},status_code=404)
+    return job
 
 
 async def scan_loop():
@@ -322,7 +365,7 @@ async def scan_loop():
             if len(c)<220: raise RuntimeError("Not enough candles")
             load_state()
             ind=indicators(c); i=len(c)-1; ts=c[i][0]
-            tok=trend_ok_for_time(h,ts); sc,reason=score_at(c,ind,i,tok)
+            tok=trend_ok_at(prepare_hourly_trend(h),ts); sc,reason=score_at(c,ind,i,tok)
             state["price"]=c[i][4]; state["score"]=sc
             state["trend"]="BULLISH" if tok else "BEARISH"; state["rsi"]=ind["rsi"][i]
             state["last_candle"]=ts; state["last_scan"]=datetime.now(timezone.utc).isoformat()
@@ -395,6 +438,11 @@ async def scan_loop():
 async def startup():
     load_state()
     asyncio.create_task(scan_loop())
+
+ 
+ 
+                
+
 
 
 
