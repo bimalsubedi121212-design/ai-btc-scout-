@@ -249,12 +249,29 @@ def simulate_range(candles, hourly, start_i, end_i, initial=20.0):
     gross_profit=sum(t[9] for t in trades if t[9]>0)
     gross_loss=-sum(t[9] for t in trades if t[9]<0)
     pf=(gross_profit/gross_loss) if gross_loss else (float("inf") if gross_profit else 0)
+    avg_win=(gross_profit/wins if wins else 0)
+    avg_loss=(gross_loss/losses if losses else 0)
+    stops=sum(1 for t in trades if t[10]=="STOP")
+    targets=sum(1 for t in trades if t[10]=="TARGET")
+    hold_minutes=[]
+    for t in trades:
+        try:
+            a=datetime.fromisoformat(t[0]); b=datetime.fromisoformat(t[1]); hold_minutes.append((b-a).total_seconds()/60)
+        except Exception: pass
+    max_losing=0; losing=0
+    for t in trades:
+        if t[9] < 0: losing += 1; max_losing=max(max_losing,losing)
+        else: losing=0
     return {"start":initial,"end":equity,"return_pct":(equity/initial-1)*100,
             "trades":len(trades),"wins":wins,"losses":losses,
             "win_rate":(wins/len(trades)*100 if trades else 0),
             "max_dd_pct":maxdd*100,"fees":fees,"profit_factor":(pf if math.isfinite(pf) else None),
             "expectancy":(sum(t[9] for t in trades)/len(trades) if trades else 0),
-            "trades_detail":trades}
+            "avg_win":avg_win,"avg_loss":avg_loss,"stops":stops,"targets":targets,
+            "stop_pct":(stops/len(trades)*100 if trades else 0),
+            "target_pct":(targets/len(trades)*100 if trades else 0),
+            "avg_hold_minutes":(sum(hold_minutes)/len(hold_minutes) if hold_minutes else 0),
+            "max_losing_streak":max_losing,"trades_detail":trades}
 
 
 async def run_backtest(days):
@@ -418,7 +435,7 @@ async def scan_loop():
 
                 # 3) If flat, schedule a signal for the NEXT candle rather than entering on signal close.
                 if not state["position"] and state["cooldown"]==0:
-                    if sc>=60 and tok:
+                    if sc>=ENTRY_SCORE and tok:
                         # daily loss gate based on realized cash vs start-of-day equity
                         today=datetime.fromtimestamp(ts/1000,timezone.utc).date()
                         if state.get("day")!=str(today):
