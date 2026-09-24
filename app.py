@@ -1,13 +1,15 @@
-import asyncio
+import asyncio, sqlite3
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-app=FastAPI(title="AI BTC Scout V6")
-SYMBOL="BTCUSDT"; TF="5m"; FEE=.001; START=20.; RISK=.01; STOP_ATR=1.5
-TARGETS=[1.5,2.0,2.5]; THRESHOLDS=[50,55,60,65]
-state={"price":0.,"equity":20.,"score":0,"rsi":50.,"trend":"UNKNOWN","signal":"WAIT","last_scan":None,"error":None}
+app=FastAPI(title="AI BTC Scout FINAL")
+SYMBOL="BTCUSDT"; START=20.0; FEE=0.001; SLIP=0.0005; RISK=0.01
+ATR_MULT=1.5; RR=2.0; COOLDOWN=6; MAX_DAILY_LOSS=0.03
+DB="bot.db"
+state={"equity":START,"cash":START,"price":0.0,"score":0,"rsi":50.0,
+       "trend":"UNKNOWN","signal":"WAIT","last_scan":None,"error":None}
 
 def ema(a,n):
     e=a[0]; k=2/(n+1); out=[]
@@ -16,34 +18,34 @@ def ema(a,n):
     return out
 
 def rsi(a,n=14):
-    out=[50.]*len(a)
+    out=[50.0]*len(a)
     if len(a)<=n:return out
     g=[max(a[i]-a[i-1],0) for i in range(1,len(a))]
     l=[max(a[i-1]-a[i],0) for i in range(1,len(a))]
     ag=sum(g[:n])/n; al=sum(l[:n])/n
-    out[n]=100 if al==0 else 100-100/(1+ag/al)
-    for i in range(n,len(g)):
-        ag=(ag*(n-1)+g[i])/n; al=(al*(n-1)+l[i])/n
-        out[i+1]=100 if al==0 else 100-100/(1+ag/al)
+    for j in range(n,len(a)):
+        if j>n:
+            ag=(ag*(n-1)+g[j-1])/n; al=(al*(n-1)+l[j-1])/n
+        out[j]=100 if al==0 else 100-100/(1+ag/al)
     return out
 
 def atr(rows,n=14):
     tr=[]
     for i,x in enumerate(rows):
         tr.append(x[2]-x[3] if i==0 else max(x[2]-x[3],abs(x[2]-rows[i-1][4]),abs(x[3]-rows[i-1][4])))
-    out=[0.]*len(rows)
-    for i in range(n,len(rows)):out[i]=sum(tr[i-n+1:i+1])/n
+    out=[0.0]*len(rows)
+    for i in range(n-1,len(rows)): out[i]=sum(tr[i-n+1:i+1])/n
     return out
 
 def avg(a,n):
-    out=[]; s=0.
+    out=[]; s=0.0
     for i,x in enumerate(a):
         s+=x
         if i>=n:s-=a[i-n]
         out.append(s/min(i+1,n))
     return out
 
-async def klines(limit=1000,start=None,end=None,interval=TF):
+async def candles(interval="5m",limit=1000,start=None,end=None):
     p={"symbol":SYMBOL,"interval":interval,"limit":min(limit,1000)}
     if start is not None:p["startTime"]=start
     if end is not None:p["endTime"]=end
@@ -52,120 +54,112 @@ async def klines(limit=1000,start=None,end=None,interval=TF):
         d=r.json()
     return [[int(x[0]),float(x[1]),float(x[2]),float(x[3]),float(x[4]),float(x[5])] for x in d]
 
-async def hist(days,interval=TF):
+async def history(days):
     now=datetime.now(timezone.utc); end=int(now.timestamp()*1000)
-    step=300000 if interval=="5m" else 3600000
-    cur=int((now-timedelta(days=days)).timestamp()*1000); d={}
+    cur=int((now-timedelta(days=days)).timestamp()*1000); step=300000; d={}
     while cur<end:
-        b=await klines(1000,cur,end,interval)
-        if not b:break
+        b=await candles("5m",1000,cur,end)
+        if not b: break
         for x in b:d[x[0]]=x
         nxt=b[-1][0]+step
-        if nxt<=cur:break
+        if nxt<=cur: break
         cur=nxt
-        if len(b)<1000:break
+        if len(b)<1000: break
     return [d[k] for k in sorted(d) if k+step<=end]
 
-def features(rows):
+def ind(rows):
     c=[x[4] for x in rows]; v=[x[5] for x in rows]
-    e20=ema(c,20); e50=ema(c,50); e200=ema(c,200); rs=rsi(c); at=atr(rows); va=avg(v,20)
-    score=[]
-    for i in range(len(rows)):
-        s=0
-        if c[i]>e20[i]:s+=20
-        if e20[i]>e50[i]:s+=20
-        if e50[i]>e200[i]:s+=20
-        if 45<=rs[i]<=68:s+=15
-        if v[i]>va[i]:s+=10
-        if rs[i]>75:s-=10
-        if rs[i]<30:s-=5
-        score.append(max(0,min(100,s)))
-    return c,e20,e50,e200,rs,at,score
+    return c,ema(c,20),ema(c,50),ema(c,200),rsi(c),atr(rows),avg(v,20)
 
-def simulate(rows,I,threshold,target_r,start_i,end_i):
-    c,e20,e50,e200,rs,at,score=I
-    cash=START; pos=None; trades=wins=0; fees=0.; peak=START; dd=0.; pnls=[]; cooldown=0
-    for i in range(start_i,end_i+1):
-        p=c[i]
+def setup(rows,I,i):
+    c,e20,e50,e200,rs,at,va=I
+    if i<205 or at[i]<=0:return False,0
+    p=c[i]; s=0
+    if p>e20[i]:s+=20
+    if e20[i]>e50[i]:s+=20
+    if 45<=rs[i]<=68:s+=15
+    if rows[i][5]>=va[i]*0.8:s+=10
+    if p>rows[i-1][2]:s+=20
+    if p>max(x[2] for x in rows[i-3:i]):s+=15
+    if p>e20[i]+1.5*at[i]:s-=15
+    return s>=60,max(0,min(100,s))
+
+def simulate(rows):
+    I=ind(rows); c,e20,e50,e200,rs,at,va=I
+    cash=START; pos=None; peak=START; dd=0; cooldown=0; trades=[]; day_pnl=0; day=None
+    for i in range(205,len(rows)):
+        o,h,l,cl=rows[i][1:5]
+        d=datetime.fromtimestamp(rows[i][0]/1000,timezone.utc).date()
+        if d!=day:day=d;day_pnl=0
         if pos:
-            hit_stop=p<=pos["stop"]; hit_target=p>=pos["target"]
-            if hit_stop or hit_target:
-                # Conservative if both are theoretically hit in a candle: stop first.
-                ep=pos["stop"] if hit_stop else pos["target"]
-                ef=pos["qty"]*ep*FEE; net=(ep-pos["entry"])*pos["qty"]-pos["entry_fee"]-ef
-                cash+=pos["qty"]*ep-ef; fees+=ef; trades+=1
-                if net>0:wins+=1
-                pnls.append(net); pos=None; cooldown=3
-        if cooldown>0:cooldown-=1
-        if pos is None and cooldown==0 and score[i]>=threshold and c[i]>e20[i] and e20[i]>e50[i] and at[i]>0:
-            risk=max(.01,cash*RISK); dist=max(at[i]*STOP_ATR,p*.001)
-            qty=risk/dist; ef=qty*p*FEE
-            if qty*p+ef<=cash:
-                cash-=qty*p+ef; fees+=ef
-                pos={"entry":p,"qty":qty,"stop":p-dist,"target":p+dist*target_r,"entry_fee":ef}
-        eq=cash+(pos["qty"]*p if pos else 0); peak=max(peak,eq); dd=max(dd,(peak-eq)/peak*100)
-    end=cash+(pos["qty"]*c[end_i] if pos else 0); n=trades
-    return {"threshold":threshold,"target_R":target_r,"ending_equity":end,"return_pct":(end/START-1)*100,
-            "trades":n,"wins":wins,"losses":n-wins,"win_rate_pct":wins/n*100 if n else 0,
-            "max_drawdown_pct":dd,"fees":fees,"avg_trade":sum(pnls)/len(pnls) if pnls else 0}
-
-async def research(days):
-    rows=await hist(days); 
-    if len(rows)<500:raise RuntimeError("Not enough candles.")
-    I=features(rows); split=max(300,int(len(rows)*.70))
-    train=[]; test=[]
-    for t in THRESHOLDS:
-        for r in TARGETS:
-            train.append(simulate(rows,I,t,r,200,split-1))
-            test.append(simulate(rows,I,t,r,split,len(rows)-1))
-    return {"days":round((rows[-1][0]-rows[0][0])/86400000,1),"candles":len(rows),
-            "train":train,"test":test}
+            exitp=None; reason=""
+            if l<=pos["stop"]:exitp=pos["stop"];reason="STOP"
+            elif h>=pos["target"]:exitp=pos["target"];reason="TARGET"
+            if exitp is not None:
+                exitp*=1-SLIP; fee=exitp*pos["qty"]*FEE
+                pnl=(exitp-pos["entry"])*pos["qty"]-pos["entry_fee"]-fee
+                cash+=exitp*pos["qty"]-fee; day_pnl+=pnl
+                trades.append((rows[i][0],pnl,reason));pos=None;cooldown=COOLDOWN
+        if cooldown:cooldown-=1
+        if pos is None and cooldown==0 and day_pnl>-START*MAX_DAILY_LOSS:
+            ok,_=setup(rows,I,i)
+            if ok:
+                dist=at[i]*ATR_MULT; risk=max(cash*RISK,0.01); qty=risk/dist
+                entry=o*(1+SLIP); ef=entry*qty*FEE
+                if qty*entry+ef<=cash:
+                    cash-=qty*entry+ef
+                    pos={"entry":entry,"qty":qty,"stop":entry-dist,"target":entry+dist*RR,"entry_fee":ef}
+        eq=cash+(pos["qty"]*cl if pos else 0);peak=max(peak,eq);dd=max(dd,(peak-eq)/peak*100)
+    end=cash+(pos["qty"]*c[-1] if pos else 0)
+    wins=sum(1 for x in trades if x[1]>0)
+    return {"ending":end,"return_pct":(end/START-1)*100,"trades":len(trades),
+            "wins":wins,"losses":len(trades)-wins,"win_rate":wins/len(trades)*100 if trades else 0,
+            "max_dd":dd,"fees":sum(abs(x[1])*0 for x in trades),"open_end":bool(pos)}
 
 async def scan():
     try:
-        rows=await klines(220); I=features(rows); c,e20,e50,e200,rs,at,score=I; i=len(rows)-1
-        state.update(price=c[i],score=score[i],rsi=rs[i],trend="BULLISH" if e20[i]>e50[i]>e200[i] else ("BEARISH" if e20[i]<e50[i]<e200[i] else "MIXED"),last_scan=datetime.now(timezone.utc).isoformat(),error=None)
-        state["signal"]="BUY" if score[i]>=65 and c[i]>e20[i] and e20[i]>e50[i] else "WAIT"
-    except Exception as e:state["error"]=str(e)
+        rows=await candles("5m",220); I=ind(rows); c,e20,e50,e200,rs,at,va=I; i=len(rows)-1
+        h=await candles("1h",220); hc,he20,he50,he200,_,_,_=ind(h)
+        bull=he20[-1]>he50[-1]>he200[-1]
+        ok,score=setup(rows,I,i); ok=ok and bull
+        state.update(price=c[i],score=score,rsi=rs[i],
+                     trend="BULLISH" if bull else "NOT BULLISH",
+                     signal="BUY" if ok else "WAIT",
+                     last_scan=datetime.now(timezone.utc).isoformat(),error=None)
+    except Exception as e: state["error"]=str(e)
 
 @app.get("/api/status")
-async def status():return JSONResponse(state)
+async def status(): return JSONResponse(state)
 
-@app.get("/api/research")
-async def api_research(days:int=Query(180,ge=90,le=365)):
-    try:return JSONResponse(await research(days))
+@app.get("/api/backtest")
+async def backtest(days:int=Query(180,ge=90,le=365)):
+    try:
+        rows=await history(days); split=int(len(rows)*.70)
+        return JSONResponse({"days":days,"candles":len(rows),
+            "train":simulate(rows[:split]),"test":simulate(rows[split:])})
     except Exception as e:return JSONResponse({"error":str(e)},status_code=500)
 
 @app.get("/",response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(r'''<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<style>
-body{background:#080b10;color:#eee;font:16px Arial;max-width:1000px;margin:auto;padding:18px}
-.c{background:#121821;border:1px solid #293545;border-radius:20px;padding:20px;margin:14px 0}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:14px}.b{font-size:28px;font-weight:bold}
-button{padding:13px 16px;border:0;border-radius:10px;margin:4px}.wrap{overflow:auto}
-table{border-collapse:collapse;width:100%;min-width:900px}th,td{border:1px solid #586575;padding:7px;text-align:center}
-@media(max-width:600px){.g{grid-template-columns:1fr}}
-</style>
-<div class=c><h1>ð¤ AI BTC Scout V6</h1><p>BTC/USDT Â· 5-minute Â· PAPER ONLY</p><h2 id=s>WAIT</h2><div class=b id=p>$--</div></div>
-<div class=g><div class=c>Score<div class=b id=sc>--</div></div><div class=c>Trend<div class=b id=t>--</div></div>
-<div class=c>RSI<div class=b id=r>--</div></div><div class=c>Paper equity<div class=b id=e>$20.00</div></div></div>
-<div class=c><h2>V6 Strategy Research</h2><p>Flexible entry thresholds + 1.5R/2R/2.5R targets, 3-candle cooldown, and 70/30 train/test split.</p>
-<button onclick=go(180)>Run 180 days</button><button onclick=go(365)>Run 365 days</button><div id=out>Ready.</div></div>
-<div class=c>Paper testing only. No exchange orders or API keys. Historical results do not guarantee future performance.</div>
+    return HTMLResponse("""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{background:#080b10;color:#eee;font:16px Arial;max-width:900px;margin:auto;padding:16px}.c{background:#121821;border:1px solid #293545;border-radius:20px;padding:20px;margin:14px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.b{font-size:28px;font-weight:bold}button{padding:13px 16px;border:0;border-radius:10px;margin:4px}@media(max-width:600px){.g{grid-template-columns:1fr}}</style>
+<div class=c><h1>AI BTC Scout FINAL</h1><p>BTC/USDT Â· 5m entry + 1h trend Â· PAPER ONLY</p><h2 id=s>WAIT</h2><div class=b id=p>$--</div></div>
+<div class=g><div class=c>Score<div class=b id=sc>--</div></div><div class=c>Trend<div class=b id=t>--</div></div><div class=c>RSI<div class=b id=r>--</div></div><div class=c>Equity<div class=b id=e>$20.00</div></div></div>
+<div class=c><h2>Final validation</h2><button onclick=run(180)>Run 180 days</button><button onclick=run(365)>Run 365 days</button><div id=o>Ready.</div></div>
+<div class=c>Paper-only. No exchange orders, no API keys, no leverage. Backtests include fees/slippage assumptions and use stop-first when both stop and target occur within a candle.</div>
 <script>
 async function q(){let x=await(await fetch('/api/status')).json();p.textContent='$'+(+x.price).toLocaleString();sc.textContent=x.score;t.textContent=x.trend;r.textContent=(+x.rsi).toFixed(1);e.textContent='$'+(+x.equity).toFixed(2);s.textContent=x.signal}
-function tab(a){let h='<div class=wrap><table><tr><th>Score</th><th>Target</th><th>End $</th><th>Return</th><th>Trades</th><th>Win%</th><th>DD</th><th>Fees</th><th>Avg/trade</th></tr>';for(let z of a)h+='<tr><td>â¥'+z.threshold+'</td><td>'+z.target_R+'R</td><td>$'+z.ending_equity.toFixed(2)+'</td><td>'+z.return_pct.toFixed(2)+'%</td><td>'+z.trades+'</td><td>'+z.win_rate_pct.toFixed(1)+'%</td><td>'+z.max_drawdown_pct.toFixed(2)+'%</td><td>$'+z.fees.toFixed(4)+'</td><td>$'+z.avg_trade.toFixed(4)+'</td></tr>';return h+'</table></div>'}
-async function go(d){out.textContent='Running '+d+'-day V6 research...';let x=await(await fetch('/api/research?days='+d)).json();if(x.error){out.textContent='Research error: '+x.error;return}out.innerHTML='<p><b>'+x.days+' days Â· '+x.candles.toLocaleString()+' candles</b></p><h3>Training period (70%)</h3>'+tab(x.train)+'<h3>Unseen test period (30%)</h3>'+tab(x.test)+'<p>Compare trade counts and unseen-test behavior. This is not a prediction.</p>'}
+async function run(d){o.textContent='Running '+d+'-day validation...';let x=await(await fetch('/api/backtest?days='+d)).json();if(x.error){o.textContent=x.error;return}let a=x.test;o.innerHTML='<p>'+x.candles.toLocaleString()+' candles</p><h3>Training 70%</h3>Ending $'+x.train.ending.toFixed(2)+' Â· Return '+x.train.return_pct.toFixed(2)+'% Â· Trades '+x.train.trades+' Â· DD '+x.train.max_dd.toFixed(2)+'%</h3><h3>Unseen test 30%</h3>Ending $'+a.ending.toFixed(2)+' Â· Return '+a.return_pct.toFixed(2)+'% Â· Trades '+a.trades+' Â· Win rate '+a.win_rate.toFixed(1)+'% Â· DD '+a.max_dd.toFixed(2)+'%<p>Test data is for validation, not parameter selection.</p>'}
 q();setInterval(q,60000)
-</script>''')
+</script>""")
 
 @app.on_event("startup")
-async def startup():asyncio.create_task(loop())
+async def startup(): asyncio.create_task(loop())
+
 async def loop():
     while True:
-        await scan()
-        await asyncio.sleep(60)
+        await scan(); await asyncio.sleep(60)
+
 
 
 
