@@ -4,7 +4,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse,JSONResponse
 BINANCE="https://api.binance.com/api/v3/klines"; SYMBOL="BTCUSDT"; START=20.0; FEE=.001; SLIP=.0005; RISK=.01; STOP_ATR=1.5; TARGET_R=2; COOLDOWN=24; MINSTOP=.01; SCORE=75; DB=os.getenv("DB_PATH","paper_trading.db")
-app=FastAPI(title="AI BTC Scout Audit"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
+app=FastAPI(title="AI BTC Scout Research V3"); state={"cash":20.,"equity":20.,"price":None,"score":0,"trend":"UNKNOWN","rsi":None,"pos":None,"processed":None,"cool":0,"pending":None,"err":None}
 def db():
  c=sqlite3.connect(DB);c.row_factory=sqlite3.Row
  c.execute("create table if not exists account(id integer primary key,cash real,equity real,peak real,dd real,updated text)")
@@ -48,16 +48,26 @@ def prep(h):
 def trend(p,ts):
  o,a,b,c=p;j=bisect.bisect_right(o,ts)-1;return j>=200 and a[j] and b[j] and c[j] and a[j]>b[j]>c[j]
 def score(c,d,i,t):
- if i<205 or any(d[k][i] is None for k in ("e20","e50","e200","rsi","atr","va")):return 0
- x=c[i];s=0
- if x[4]>d["e20"][i]:s+=20
- if d["e20"][i]>d["e50"][i]:s+=20
- if 45<=d["rsi"][i]<=65:s+=15
- if x[5]>=d["va"][i]:s+=10
- if x[4]>c[i-1][2]:s+=20
- if x[4]>max(z[2] for z in c[i-3:i]):s+=15
- if x[4]>d["e20"][i]+1.5*d["atr"][i]:s-=15
- return max(0,min(100,s)) if t else 0
+ if i<205 or any(d[k][i] is None for k in ("e20","e50","e200","rsi","atr","va")): return 0
+ if not t: return 0
+ # V3 hypothesis: bullish pullback/reclaim instead of fresh breakout chasing.
+ close=c[i][4]; prev_close=c[i-1][4]; prev_low=c[i-1][3]
+ e20,e50,e200=d["e20"][i],d["e50"][i],d["e200"][i]
+ rs,at,v=d["rsi"][i],d["atr"][i],d["va"][i]
+ pullback=(prev_low<=d["e20"][i-1] or prev_close<=d["e20"][i-1])
+ reclaim=(close>e20 and close>c[i-1][2])
+ healthy_rsi=(48<=rs<=64)
+ volume_ok=(c[i][5]>=0.90*v)
+ not_stretched=(close<=e20+1.0*at)
+ s=0
+ if e20>e50>e200: s+=30
+ if pullback: s+=25
+ if reclaim: s+=25
+ if healthy_rsi: s+=10
+ if volume_ok: s+=10
+ if not not_stretched: s-=20
+ return max(0,min(100,s))
+
 async def fetch(days,iv):
  end=int(datetime.now(timezone.utc).timestamp()*1000);cur=int((datetime.now(timezone.utc)-timedelta(days=days)).timestamp()*1000);out=[]
  async with httpx.AsyncClient(timeout=20) as cl:
@@ -136,15 +146,3 @@ async def scan():
   await asyncio.sleep(60)
 @app.on_event('startup')
 async def startup():load();asyncio.create_task(scan())
-
- 
- 
-                
-
-
-
-
-
-
-
-
