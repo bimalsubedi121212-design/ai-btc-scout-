@@ -122,7 +122,7 @@ def sigmoid(z):
     z=max(-30,min(30,z))
     return 1/(1+math.exp(-z))
 
-def fit_logistic(X,y,epochs=80,lr=.08,l2=.001):
+def fit_logistic(X,y,epochs=20,lr=.08,l2=.001):
     if not X: return None
     w=[0.0]*len(X[0])
     for _ in range(epochs):
@@ -153,9 +153,9 @@ def walk_forward_ml(c):
         f=ml_features(c,i)
         if f is None: continue
         # Walk-forward refit every 96 candles using only data available before i.
-        if (i-cut)%96==0:
+        if (i-cut)%384==0:
             X=[];Y=[]
-            start=max(warm,i-3000)
+            start=max(warm,i-1500)
             for j in range(start,i-horizon):
                 fj=ml_features(c,j)
                 if fj is not None:
@@ -167,24 +167,24 @@ def walk_forward_ml(c):
             if hit_stop or hit_target:
                 raw=pos["stop"] if hit_stop else pos["target"]
                 reason="STOP" if hit_stop else "TARGET"
-                ex=raw*(1-SLIPPAGE);pro=pos["qty"]*ex;ef=pro*FEE
+                ex=raw*(1-SLIP);pro=pos["qty"]*ex;ef=pro*FEE
                 net=(ex-pos["entry"])*pos["qty"]-pos["fee"]-ef
-                cash+=pro-ef;fees+=pos["fee"]+ef;slips+=raw*SLIPPAGE*pos["qty"];turn+=pro
+                cash+=pro-ef;fees+=pos["fee"]+ef;slips+=raw*SLIP*pos["qty"];turn+=pro
                 tr.append(net);pos=None
         eq=cash+(pos["qty"]*c[i][4] if pos else 0);peak=max(peak,eq);mdd=max(mdd,(peak-eq)/peak)
         if not pos and p>=.55:
-            entry=c[i+1][1]*(1+SLIPPAGE)
+            entry=c[i+1][1]*(1+SLIP)
             recent=[abs(c[j][2]-c[j][3]) for j in range(max(0,i-14),i+1)]
             at=sum(recent)/len(recent)
-            stop=entry-max(STOP_ATR*at,entry*MIN_STOP_PCT)
-            risk=max(entry-stop,entry*MIN_STOP_PCT)
+            stop=entry-max(STOP_ATR*at,entry*MINSTOP)
+            risk=max(entry-stop,entry*MINSTOP)
             qty=min((eq*RISK_PCT)/risk,cash/(entry*(1+FEE)))
             qty=min(qty,(eq*.25)/entry)
             if qty>0:
-                no=qty*entry;ef=no*FEE;cash-=no+ef;fees+=ef;slips+=entry*SLIPPAGE*qty;turn+=no
+                no=qty*entry;ef=no*FEE;cash-=no+ef;fees+=ef;slips+=entry*SLIP*qty;turn+=no
                 pos={"entry":entry,"qty":qty,"stop":stop,"target":entry+1.5*(entry-stop),"fee":ef}
     if pos:
-        ex=c[-1][4]*(1-SLIPPAGE);pro=pos["qty"]*ex;ef=pro*FEE
+        ex=c[-1][4]*(1-SLIP);pro=pos["qty"]*ex;ef=pro*FEE
         cash+=pro-ef;fees+=pos["fee"]+ef;turn+=pro
         tr.append((ex-pos["entry"])*pos["qty"]-pos["fee"]-ef)
     wins=sum(x>0 for x in tr);losses=sum(x<0 for x in tr)
@@ -232,7 +232,7 @@ async def ml_route(days:int):
   try:
    jobs[jid]["status"]="running"
    c=await fetch(days,"15m")
-   jobs[jid]["result"]=walk_forward_ml(c)
+   jobs[jid]["result"]=await asyncio.to_thread(walk_forward_ml,c)
    jobs[jid]["status"]="done"
   except Exception as e:
    jobs[jid]={"status":"error","error":str(e)}
